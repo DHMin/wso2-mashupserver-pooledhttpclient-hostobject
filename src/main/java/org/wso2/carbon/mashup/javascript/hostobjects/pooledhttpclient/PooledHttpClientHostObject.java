@@ -1,6 +1,4 @@
 /**
- * Copyright (c) 2009, WSO2 Inc. (http://www.wso2.org) All Rights Reserved.
- *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -13,19 +11,19 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.wso2.carbon.mashup.javascript.hostobjects.pooledhttpclient;
 
 import java.io.ByteArrayInputStream;
-import java.io.IOException;
 import java.io.UnsupportedEncodingException;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.Hashtable;
 import java.util.List;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 import org.apache.commons.httpclient.Cookie;
-import org.apache.commons.httpclient.Header;
 import org.apache.commons.httpclient.HttpClient;
 import org.apache.commons.httpclient.HttpMethod;
 import org.apache.commons.httpclient.MultiThreadedHttpConnectionManager;
@@ -55,8 +53,8 @@ import org.mozilla.javascript.UniqueTag;
 /**
  * <p/>
  * This is a JavaScript Rhino host object aimed to provide a set of functions to
- * do HTTP POST/GET for the javascript service developers.
- * WSO2 version of httpclient did not provide concurrency, yet this one does.
+ * do HTTP POST/GET for the javascript service developers. WSO2 version of
+ * httpclient did not provide concurrency, yet this one does.
  * </p>
  * 
  * @author WSO2
@@ -64,10 +62,15 @@ import org.mozilla.javascript.UniqueTag;
  */
 public class PooledHttpClientHostObject extends ScriptableObject {
 
-    private static final int POOL_PER_THREAD_MAX_SIZE = 4;
-    private static final int POOL_GLOBAL_MAX_SIZE = POOL_PER_THREAD_MAX_SIZE*50;
-    
-    private Hashtable<String, HttpMethod> methodsPool = new Hashtable<String, HttpMethod>();
+    /**
+     * 
+     */
+    private static final long serialVersionUID = 8681818519236634437L;
+
+    public static final int CONN_POOL_THREAD_MAX = 10;
+    public static final int CONN_POOL_GLOBAL_MAX = CONN_POOL_THREAD_MAX * 30;
+    public static final int THREAD_POOL_MAX = 100;
+
     private HttpClient httpClient;
 
     private NativeArray authSchemePriority = null;
@@ -86,13 +89,18 @@ public class PooledHttpClientHostObject extends ScriptableObject {
     private static final String PATH = "/";
     private static final Boolean SECURE = false;
 
+    private static final ArrayBlockingQueue<Runnable> queue = new ArrayBlockingQueue<Runnable>(
+	    THREAD_POOL_MAX);
+    private static final ThreadPoolExecutor pool = new ThreadPoolExecutor(
+	    THREAD_POOL_MAX, THREAD_POOL_MAX, 180, TimeUnit.SECONDS, queue);
+
     public PooledHttpClientHostObject() {
 	MultiThreadedHttpConnectionManager connectionManager = new MultiThreadedHttpConnectionManager();
 	HttpConnectionManagerParams params = connectionManager.getParams();
-	params.setDefaultMaxConnectionsPerHost(POOL_PER_THREAD_MAX_SIZE);
-	params.setMaxTotalConnections(POOL_GLOBAL_MAX_SIZE);
-	
-	this.httpClient = new HttpClient(connectionManager); 
+	params.setDefaultMaxConnectionsPerHost(CONN_POOL_THREAD_MAX);
+	params.setMaxTotalConnections(CONN_POOL_GLOBAL_MAX);
+
+	this.httpClient = new HttpClient(connectionManager);
     }
 
     /**
@@ -108,7 +116,7 @@ public class PooledHttpClientHostObject extends ScriptableObject {
      */
     public static Scriptable jsConstructor(Context cx, Object[] args,
 	    Function ctorObj, boolean inNewExpr) {
-
+	cx.setWrapFactory(new PrimitiveWrapFactory());
 	PooledHttpClientHostObject httpClient = new PooledHttpClientHostObject();
 	if (args.length != 0) {
 	    throw new RuntimeException(
@@ -130,74 +138,62 @@ public class PooledHttpClientHostObject extends ScriptableObject {
      *          in String method | in String url [, in String/Object content [, in Object params [,
      * Object headers]]]);
      */
-    public static Scriptable jsFunction_executeMethod(Context cx, Scriptable thisObj,
-	    Object[] args, Function funObj) {
-	
+    public static Scriptable jsFunction_executeMethod(Context cx,
+	    Scriptable thisObj, Object[] args, Function funObj) {
+
 	HttpMethod method = null;
-	PooledHttpClientHostObject httpClient = (PooledHttpClientHostObject) thisObj;
+	PooledHttpClientHostObject httpClientHostObject = (PooledHttpClientHostObject) thisObj;
 
 	List<String> authSchemes = new ArrayList<String>();
 
-	String contentType = httpClient.DEFAULT_CONTENT_TYPE;
-	String charset = httpClient.DEFAULT_CHARSET;
+	String contentType = PooledHttpClientHostObject.DEFAULT_CONTENT_TYPE;
+	String charset = PooledHttpClientHostObject.DEFAULT_CHARSET;
 
 	/*
 	 * we check weather authSchemes Priority has been set and put them into
 	 * a List
 	 */
-	if (httpClient.authSchemePriority != null) {
-	    setAuthSchemes(httpClient, authSchemes);
+	if (httpClientHostObject.authSchemePriority != null) {
+	    setAuthSchemes(httpClientHostObject, authSchemes);
 	}
 
-	if (httpClient.credentials != null) {
-	    setCredentials(httpClient, authSchemes);
+	if (httpClientHostObject.credentials != null) {
+	    setCredentials(httpClientHostObject, authSchemes);
 	}
 
-	if (httpClient.proxyCredentials != null) {
-	    setProxyCredentials(httpClient, authSchemes);
+	if (httpClientHostObject.proxyCredentials != null) {
+	    setProxyCredentials(httpClientHostObject, authSchemes);
 	}
 
 	// checks whether cookies have been set
-	if (httpClient.cookies != null) {
-	    setCookies(httpClient);
+	if (httpClientHostObject.cookies != null) {
+	    setCookies(httpClientHostObject);
 	}
 
 	String methodName = null;
-	String url = null;
+	// String url = null;
+	NativeArray urls = null;
 	Object content = null;
 	NativeObject params = null;
 	NativeArray headers = null;
 
-	// parse the passed arguments into this executeMethod()
-	switch (args.length) {
-	case 2:
-	    if (args[0] instanceof String) {
-		methodName = (String) args[0];
-	    } else {
-		throw new RuntimeException(
-			"HTTP method should be a String value");
-	    }
+	if (args[0] instanceof String) {
+	    methodName = (String) args[0];
+	} else {
+	    throw new RuntimeException("HTTP method should be a String value");
+	}
 
-	    if (args[1] instanceof String) {
-		url = (String) args[1];
-	    } else {
-		throw new RuntimeException("Url should be a String value");
-	    }
-	    break;
-	case 3:
-	    if (args[0] instanceof String) {
-		methodName = (String) args[0];
-	    } else {
-		throw new RuntimeException(
-			"HTTP method should be a String value");
-	    }
+	if (args[1] instanceof String) {
+	    Object[] tmp = { args[1] };
+	    urls = (NativeArray) cx.newArray(thisObj, tmp);
+	} else if (args[1] instanceof NativeArray) {
+	    urls = (NativeArray) args[1];
+	} else {
+	    throw new RuntimeException(
+		    "Url should be a String value or Array of Strings");
+	}
 
-	    if (args[1] instanceof String) {
-		url = (String) args[1];
-	    } else {
-		throw new RuntimeException("Url should be a String value");
-	    }
-
+	if (args.length > 2) {
 	    if (args[2] instanceof String) {
 		content = (String) args[2];
 	    } else if (args[2] instanceof NativeArray) {
@@ -206,142 +202,100 @@ public class PooledHttpClientHostObject extends ScriptableObject {
 		throw new RuntimeException(
 			"Content should be a String value or Array of Name-value pairs");
 	    }
-	    break;
-	case 4:
-	    if (args[0] instanceof String) {
-		methodName = (String) args[0];
-	    } else {
-		throw new RuntimeException(
-			"HTTP method should be a String value");
-	    }
+	}
 
-	    if (args[1] instanceof String) {
-		url = (String) args[1];
-	    } else {
-		throw new RuntimeException("Url should be a String value");
-	    }
-
-	    if (args[2] instanceof String) {
-		content = (String) args[2];
-	    } else if (args[2] instanceof NativeArray) {
-		content = (NativeArray) args[2];
-	    } else if (args[2] != null) {
-		throw new RuntimeException(
-			"Content should be a String value or Array of Name-value pairs");
-	    }
-
+	if (args.length > 3) {
 	    if (args[3] instanceof NativeObject) {
 		params = (NativeObject) args[3];
 	    } else if (args[3] != null) {
 		throw new RuntimeException(
 			"Params argument should be an Object");
 	    }
-	    break;
-	case 5:
-	    if (args[0] instanceof String) {
-		methodName = (String) args[0];
-	    } else {
-		throw new RuntimeException(
-			"HTTP method should be a String value");
-	    }
+	}
 
-	    if (args[1] instanceof String) {
-		url = (String) args[1];
-	    } else {
-		throw new RuntimeException("Url should be a String value");
-	    }
-
-	    if (args[2] instanceof String) {
-		content = (String) args[2];
-	    } else if (args[2] instanceof NativeArray) {
-		content = (NativeArray) args[2];
-	    } else if (args[2] != null) {
-		throw new RuntimeException(
-			"Content should be a String value or Array of Name-value pairs");
-	    }
-
-	    if (args[3] instanceof NativeObject) {
-		params = (NativeObject) args[3];
-	    } else if (args[3] != null) {
-		throw new RuntimeException(
-			"Params argument should be an Object");
-	    }
-
+	if (args.length > 4) {
 	    if (args[4] instanceof NativeArray) {
 		headers = (NativeArray) args[4];
 	    } else if (args[4] != null) {
 		throw new RuntimeException(
 			"Headers argument should be an Object");
 	    }
-	    break;
 	}
 
-	if (url != null) {
-	    if (methodName.equals("GET")) {
-		method = new GetMethod(url);
-	    } else if (methodName.equals("POST")) {
-		method = new PostMethod(url);
-	    } else if (methodName.equals("PUT")) {
-		method = new PutMethod(url);
-	    } else if (methodName.equals("DELETE")) {
-		method = new DeleteMethod(url);
+	Hashtable<String, SimpleHttpResponse> result = new Hashtable<String, SimpleHttpResponse>();
+	int i = 0;
+	for (i = 0; i < urls.getLength(); i++) {
+	    String url = urls.get(i, urls).toString();
+
+	    if (url != null) {
+		if (methodName.equals("GET")) {
+		    method = new GetMethod(url);
+		} else if (methodName.equals("POST")) {
+		    method = new PostMethod(url);
+		} else if (methodName.equals("PUT")) {
+		    method = new PutMethod(url);
+		} else if (methodName.equals("DELETE")) {
+		    method = new DeleteMethod(url);
+		} else {
+		    throw new RuntimeException(
+			    "HTTP method you specified is not supported");
+		}
 	    } else {
-		throw new RuntimeException(
-			"HTTP method you specified is not supported");
+		throw new RuntimeException("A url should be specified");
 	    }
+
+	    if (headers != null) {
+		setHeaders(method, headers);
+	    }
+
+	    if (params != null) {
+		setParams(httpClientHostObject, method, contentType, charset,
+			methodName, content, params);
+	    } else if (content != null) {
+		setContent(method, contentType, charset, methodName, content);
+	    }
+
+	    // check whether host configuration details has been set
+	    if (httpClientHostObject.host != null) {
+		setHostConfig(httpClientHostObject);
+	    }
+
+	    pool.execute(new HttpCommand(httpClientHostObject.httpClient,
+		    method, result, i));
+	}
+
+	// wait for the result.
+	int total = i;
+	do {
+	    try {
+		Thread.sleep(100);
+	    } catch (InterruptedException e) {
+		throw new RuntimeException(e);
+	    }
+	} while (result.size() < total);
+
+	if (result.size() == 1) {
+	    return Context.toObject(result.get("0"), thisObj);
 	} else {
-	    throw new RuntimeException("A url should be specified");
+	    // order matters
+	    Object[] res = new Object[result.size()];
+	    for (i = 0; i < result.size(); i++) {
+		res[i] = result.get(i + "");
+	    }
+	    return Context.toObject(res, thisObj);
 	}
-
-	if (headers != null) {
-	    setHeaders(method, headers);
-	}
-
-	if (params != null) {
-	    setParams(httpClient, method, contentType, charset, methodName, content,
-		    params);
-	} else if (content != null) {
-	    setContent(method, contentType, charset, methodName, content);
-	}
-
-	// check whether host configuration details has been set
-	if (httpClient.host != null) {
-	    setHostConfig(httpClient);
-	}
-
-	try {
-	    httpClient.httpClient.executeMethod(method);
-	    return Context.toObject(toResponse(method), thisObj); 
-	} catch (IOException e) {
-	    throw new RuntimeException("Error while executing HTTP method", e);
-	} finally {
-	    method.releaseConnection();
-	}
-    }
-    
-    private static SimpleHttpResponse toResponse(HttpMethod method) {
-	Header[] headers = method.getResponseHeaders();
-	String headersString = "";
-	for(Header header: headers) {
-	    headersString += header.toString();
-	}
-	SimpleHttpResponse response = new SimpleHttpResponse();
-	
-	response.statusCode = method.getStatusCode()+"";
-	response.statusText = method.getStatusText();
-	response.headers = headersString;
-	try {
-	    response.response = method.getResponseBodyAsString();
-	} catch(Exception e) {
-	    throw new RuntimeException("", e);
-	}
-	return response;
     }
 
     /**
-     * <p> This property sets the authSchemePriority of the HttpClient's
-     * authentications schemes </p> <pre> httpClient.authSchemePriority =
-     * ["NTLM", "BASIC", "DIGEST"]; </pre>
+     * <p>
+     * This property sets the authSchemePriority of the HttpClient's
+     * authentications schemes
+     * </p>
+     * 
+     * <pre>
+     * httpClient.authSchemePriority =
+     * ["NTLM", "BASIC", "DIGEST"];
+     * </pre>
      */
     public void jsSet_authSchemePriority(Object object) {
 	// sets authentication scheme priority of apache httpclient
@@ -354,7 +308,11 @@ public class PooledHttpClientHostObject extends ScriptableObject {
     }
 
     /**
-     * <p> This property sets cookies of the HttpClient </p> <pre>
+     * <p>
+     * This property sets cookies of the HttpClient
+     * </p>
+     * 
+     * <pre>
      * httpClient.cookies = [ { domain : ".wso2.com", name : "myCookie", value :
      * "ADCFE113450593", path : "/", age : 20000, secure : true}, ..... ..... ];
      * </pre>
@@ -369,10 +327,15 @@ public class PooledHttpClientHostObject extends ScriptableObject {
     }
 
     /**
-     * <p> This property sets credentials of the HttpClient </p> <pre>
+     * <p>
+     * This property sets credentials of the HttpClient
+     * </p>
+     * 
+     * <pre>
      * httpClient.credentials = { scope : { host : "www.wso2.com", port : 80,
      * realm : "web", scheme : "basic"}, credentials : { username : "ruchira",
-     * password : "ruchira"} }; </pre>
+     * password : "ruchira"} };
+     * </pre>
      */
     public void jsSet_credentials(Object object) {
 	// sets authentication scheme priority of apache httpclient
@@ -385,10 +348,15 @@ public class PooledHttpClientHostObject extends ScriptableObject {
     }
 
     /**
-     * <p> This property sets credentials of the HttpClient </p> <pre>
+     * <p>
+     * This property sets credentials of the HttpClient
+     * </p>
+     * 
+     * <pre>
      * httpClient.credentials = { scope : { host : "www.wso2.com", port : 80,
      * realm : "web", scheme : "basic"}, credentials : { username : "ruchira",
-     * password : "ruchira"} }; </pre>
+     * password : "ruchira"} };
+     * </pre>
      */
     public void jsSet_proxyCredentials(Object object) {
 	// sets authentication scheme priority of apache httpclient
@@ -403,9 +371,14 @@ public class PooledHttpClientHostObject extends ScriptableObject {
     }
 
     /**
-     * <p> This property sets host configurations of the HttpClient </p> <pre>
+     * <p>
+     * This property sets host configurations of the HttpClient
+     * </p>
+     * 
+     * <pre>
      * httpClient.host = { host : "www.wso2.com", port : 80, protocol :
-     * "https"}; </pre>
+     * "https"};
+     * </pre>
      */
     public void jsSet_host(Object object) {
 	// sets authentication scheme priority of apache httpclient
@@ -416,7 +389,6 @@ public class PooledHttpClientHostObject extends ScriptableObject {
 	}
     }
 
-    
     /**
      * Used by jsFunction_executeMethod().
      * 
@@ -424,8 +396,8 @@ public class PooledHttpClientHostObject extends ScriptableObject {
      */
     private static void setHostConfig(PooledHttpClientHostObject httpClient) {
 	String host;
-	int port = httpClient.DEFAULT_HOST_PORT;
-	String protocol = httpClient.DEFAULT_HOST_PROTOCOL;
+	int port = PooledHttpClientHostObject.DEFAULT_HOST_PORT;
+	String protocol = PooledHttpClientHostObject.DEFAULT_HOST_PROTOCOL;
 
 	if (ScriptableObject.getProperty(httpClient.host, "host") instanceof String) {
 	    host = (String) ScriptableObject.getProperty(httpClient.host,
@@ -456,9 +428,8 @@ public class PooledHttpClientHostObject extends ScriptableObject {
      * @param methodName
      * @param content
      */
-    private static void setContent(HttpMethod method,
-	    String contentType, String charset, String methodName,
-	    Object content) {
+    private static void setContent(HttpMethod method, String contentType,
+	    String charset, String methodName, Object content) {
 	// content is set, but params has not set
 	// use default content type and encoding when posting
 	if (methodName.equals("POST")) {
@@ -536,8 +507,8 @@ public class PooledHttpClientHostObject extends ScriptableObject {
 					+ "Javascript Objects");
 		    }
 		}
-		method.setQueryString(pairs
-			.toArray(new NameValuePair[pairs.size()]));
+		method.setQueryString(pairs.toArray(new NameValuePair[pairs
+			.size()]));
 	    }
 	} else if (methodName.equals("PUT")) {
 	    // here, the method now is PUT
@@ -569,9 +540,9 @@ public class PooledHttpClientHostObject extends ScriptableObject {
      * @param content
      * @param params
      */
-    private static void setParams(PooledHttpClientHostObject httpClient, HttpMethod method,
-	    String contentType, String charset, String methodName,
-	    Object content, NativeObject params) {
+    private static void setParams(PooledHttpClientHostObject httpClient,
+	    HttpMethod method, String contentType, String charset,
+	    String methodName, Object content, NativeObject params) {
 	// other parameters have been set, they are properly set to the
 	// corresponding context
 	if (ScriptableObject.getProperty(params, "cookiePolicy") instanceof String) {
@@ -607,16 +578,16 @@ public class PooledHttpClientHostObject extends ScriptableObject {
 	}
 
 	if (ScriptableObject.getProperty(params, "doAuthentication") instanceof Boolean) {
-	    method.setDoAuthentication((Boolean) ScriptableObject
-		    .getProperty(params, "doAuthentication"));
+	    method.setDoAuthentication((Boolean) ScriptableObject.getProperty(
+		    params, "doAuthentication"));
 	} else if (!ScriptableObject.getProperty(params, "doAuthentication")
 		.equals(UniqueTag.NOT_FOUND)) {
 	    throw new RuntimeException("Method parameters should be Strings");
 	}
 
 	if (ScriptableObject.getProperty(params, "followRedirect") instanceof Boolean) {
-	    method.setFollowRedirects((Boolean) ScriptableObject
-		    .getProperty(params, "followRedirect"));
+	    method.setFollowRedirects((Boolean) ScriptableObject.getProperty(
+		    params, "followRedirect"));
 	} else if (!ScriptableObject.getProperty(params, "followRedirect")
 		.equals(UniqueTag.NOT_FOUND)) {
 	    throw new RuntimeException("Method parameters should be Strings");
@@ -766,8 +737,8 @@ public class PooledHttpClientHostObject extends ScriptableObject {
 					    + "Javascript Objects");
 			}
 		    }
-		    method.setQueryString(pairs
-			    .toArray(new NameValuePair[pairs.size()]));
+		    method.setQueryString(pairs.toArray(new NameValuePair[pairs
+			    .size()]));
 		}
 	    }
 	} else if (methodName.equals("PUT")) {
@@ -816,7 +787,7 @@ public class PooledHttpClientHostObject extends ScriptableObject {
 	    }
 
 	}
-	
+
 	// check whether preemptive authentication is used
 	if (ScriptableObject.getProperty(params, "preemptiveAuth") instanceof Boolean) {
 	    httpClient.httpClient.getParams().setAuthenticationPreemptive(
@@ -827,15 +798,14 @@ public class PooledHttpClientHostObject extends ScriptableObject {
 	    throw new RuntimeException("Method parameters should be Strings");
 	}
     }
-    
+
     /**
      * Used by jsFunction_executeMethod().
      * 
      * @param httpMethod
      * @param headers
      */
-    private static void setHeaders(HttpMethod httpMethod,
-	    NativeArray headers) {
+    private static void setHeaders(HttpMethod httpMethod, NativeArray headers) {
 	// headers array is parsed and headers are set
 	String hName;
 	String hValue;
@@ -865,9 +835,9 @@ public class PooledHttpClientHostObject extends ScriptableObject {
 	String domain;
 	String name;
 	String value;
-	String path = httpClient.PATH;
-	Object age = httpClient.AGE;
-	boolean secure = httpClient.SECURE;
+	String path = PooledHttpClientHostObject.PATH;
+	Object age = PooledHttpClientHostObject.AGE;
+	boolean secure = PooledHttpClientHostObject.SECURE;
 
 	NativeObject cookie;
 
@@ -951,8 +921,8 @@ public class PooledHttpClientHostObject extends ScriptableObject {
      * @param httpClient
      * @param authSchemes
      */
-    private static void setProxyCredentials(PooledHttpClientHostObject httpClient,
-	    List<String> authSchemes) {
+    private static void setProxyCredentials(
+	    PooledHttpClientHostObject httpClient, List<String> authSchemes) {
 	// gets proxy credentials of the scheme
 	if (ScriptableObject.getProperty(httpClient.proxyCredentials,
 		"credentials") instanceof NativeObject) {
